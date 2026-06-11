@@ -6,14 +6,21 @@ from dotenv import load_dotenv
 import streamlit as st
 
 # Prioritize api_key.env fallback mapping
-#env_path = Path(".env") if Path(".env").exists() else Path("api_key.env")
-#load_dotenv(env_path)
+env_path = Path(".env") if Path(".env").exists() else Path("api_key.env")
+load_dotenv(env_path)
 
 class LLMManager:
     def __init__(self, model_name="nvidia/llama-3.3-nemotron-super-49b-v1.5"):
+        # Check Streamlit secrets first, fallback to environment variable
+        api_key = None
+        try:
+            api_key = st.secrets["API_KEY"]
+        except Exception:
+            pass
         
-        api_key = st.secrets["API_KEY"]
-
+        if not api_key:
+            api_key = os.getenv("NVIDIA_API_KEY")
+            
         self.client = OpenAI(
             base_url="https://integrate.api.nvidia.com/v1",
             api_key=api_key
@@ -47,15 +54,25 @@ class LLMManager:
     def get_response(self, messages, stream=True):
         # Keep a sliding window of the last 10 messages to avoid token limit issues
         trimmed_messages = messages[-10:]
-        return self._retry_api_call(
-            self.client.chat.completions.create,
-            model=self.model_name,
-            messages=trimmed_messages,
-            temperature=0.2,  # Fixed low for deterministic analysis stability
-            top_p=1,
-            max_tokens=2048,
-            stream=stream
-        )
+        
+        def call_and_validate():
+            response = self.client.chat.completions.create(
+                model=self.model_name,
+                messages=trimmed_messages,
+                temperature=0.2,  # Fixed low for deterministic analysis stability
+                top_p=1,
+                max_tokens=2048,
+                stream=stream
+            )
+            if not stream:
+                if not response or not response.choices:
+                    raise ValueError("LLM returned an empty response (no choices).")
+                content = response.choices[0].message.content
+                if content is None or content.strip() == "":
+                    raise ValueError("LLM returned empty or null content.")
+            return response
+
+        return self._retry_api_call(call_and_validate)
 
     def get_embedding(self, text: str):
         """Generates contextual float embeddings using the NVIDIA NIM footprint"""
