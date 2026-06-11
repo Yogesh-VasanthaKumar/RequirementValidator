@@ -3,6 +3,7 @@ from pathlib import Path
 from typing import List
 from openai import OpenAI
 from dotenv import load_dotenv
+import streamlit as st
 
 # Prioritize api_key.env fallback mapping
 #env_path = Path(".env") if Path(".env").exists() else Path("api_key.env")
@@ -10,10 +11,8 @@ from dotenv import load_dotenv
 
 class LLMManager:
     def __init__(self, model_name="nvidia/llama-3.3-nemotron-super-49b-v1.5"):
-        #api_key = os.getenv("NVIDIA_API_KEY")
+        
         api_key = st.secrets["API_KEY"]
-        if not api_key:
-            raise EnvironmentError("NVIDIA_API_KEY is not set. Add it to .env or api_key.env in the project root.")
 
         self.client = OpenAI(
             base_url="https://integrate.api.nvidia.com/v1",
