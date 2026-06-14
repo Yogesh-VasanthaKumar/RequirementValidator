@@ -14,7 +14,16 @@ def clean_and_parse_json(text: str) -> dict:
     if start == -1 or end == -1:
         raise ValueError("No JSON block found in LLM response.")
     text = text[start:end+1]
-    return json.loads(text)
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        import re
+        text = re.sub(r',\s*}', '}', text)
+        text = re.sub(r',\s*\]', ']', text)
+        try:
+            return json.loads(text)
+        except Exception as e:
+            raise ValueError(f"Failed to parse JSON even after cleanup: {str(e)}")
 
 def analyze_single_requirement(index, r, llm, rag, rag_context=None, selected_collections=None):
     try:
@@ -35,7 +44,7 @@ def analyze_single_requirement(index, r, llm, rag, rag_context=None, selected_co
             "   - MUST use the standard modal verb 'shall' (do not use should, will, must, or behaves).\n"
             "   - MUST NOT contain vague or subjective terms (e.g. fast, quickly, beautifully, great, modern, creepy).\n"
             "   - MUST be verifiable and measurable.\n"
-            "   - MUST NOT combine multiple distinct requirements (e.g. multiple actions).\n"
+            "   - MUST NOT combine multiple distinct requirements in a single sentence (e.g. multiple actions). (EXCEPTION: If the text contains multiple distinct requirement sentences clearly separated by newlines, this is ACCEPTABLE as long as each sentence is individually compliant and atomic).\n"
         )
         if rag_context:
             system_prompt += (
@@ -83,9 +92,6 @@ def analyze_single_requirement(index, r, llm, rag, rag_context=None, selected_co
         }
 
 def analyze_batch(batch_items, llm, rag, selected_collections=None):
-    # batch_items is a list of tuples: (index, Requirement)
-    # Returns a list of dicts mapping index -> analysis_result
-    
     req_details = []
     full_reqs = []
     for idx, r in batch_items:
@@ -104,7 +110,6 @@ def analyze_batch(batch_items, llm, rag, selected_collections=None):
         except Exception:
             pass
     
-    # 2. Build prompts
     system_prompt = (
         "You are an expert systems engineering auditor specializing in ASPICE, INCOSE, and EARS requirement standards.\n"
         "Your task is to structurally parse and analyze a batch of engineering requirements.\n"
@@ -114,7 +119,7 @@ def analyze_batch(batch_items, llm, rag, selected_collections=None):
         "   - MUST use the standard modal verb 'shall' (do not use should, will, must, or behaves).\n"
         "   - MUST NOT contain vague or subjective terms (e.g. fast, quickly, beautifully, great, modern, creepy).\n"
         "   - MUST be verifiable and measurable.\n"
-        "   - MUST NOT combine multiple distinct requirements (e.g. multiple actions).\n"
+        "   - MUST NOT combine multiple distinct requirements in a single sentence (e.g. multiple actions). (EXCEPTION: If the text contains multiple distinct requirement sentences clearly separated by newlines, this is ACCEPTABLE as long as each sentence is individually compliant and atomic).\n"
         "For each requirement in the batch, check these rules and any project-specific rules provided.\n\n"
         "\nStructurally parse each requirement internally into Preconditions, System Name, Modality, and System Response. Then evaluate the rules.\n"
         "You must return your output strictly in JSON format matching this schema:\n"
@@ -147,7 +152,12 @@ def analyze_batch(batch_items, llm, rag, selected_collections=None):
         
     messages = [
         {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_content}
+        {"role": "user", "content":  f"""
+Requirement:{user_content}Analyze the requirement.
+Correct INCOSE violations.
+Correct EARS violations.
+Split if multiple behaviors exist.
+Return JSON only."""}
     ]
     
     response = llm.get_response(messages, stream=False)
@@ -169,7 +179,6 @@ def analyze_batch(batch_items, llm, rag, selected_collections=None):
         if idx in results_by_index:
             res = results_by_index[idx]
         else:
-            # Try to lookup by ID
             r_id = str(item['r'].name).strip().lower()
             for r_res in data.get("results", []):
                 if str(r_res.get("id")).strip().lower() == r_id:
@@ -195,7 +204,7 @@ def analyze_requirements_batch(requirements: List[Requirement], llm, progress_ca
     total = len(requirements)
     analysis_data = [None] * total
     
-    batch_size = 5
+    batch_size = 10
     batches = []
     for i in range(0, total, batch_size):
         batches.append([(idx, requirements[idx]) for idx in range(i, min(i + batch_size, total))])
@@ -204,14 +213,13 @@ def analyze_requirements_batch(requirements: List[Requirement], llm, progress_ca
         try:
             return analyze_batch(batch, llm, rag, selected_collections)
         except Exception:
-            # Fallback to single requirement analysis
             fallback_results = {}
             for idx, r in batch:
                 _, res = analyze_single_requirement(idx, r, llm, rag, selected_collections=selected_collections)
                 fallback_results[idx] = res
             return fallback_results
 
-    with ThreadPoolExecutor(max_workers=4) as executor:
+    with ThreadPoolExecutor(max_workers=6) as executor:
         futures = {executor.submit(process_batch, b): b for b in batches}
         
         completed_count = 0
@@ -221,15 +229,11 @@ def analyze_requirements_batch(requirements: List[Requirement], llm, progress_ca
                 analysis_data[idx] = res
                 completed_count += 1
             if progress_callback:
-                progress_callback(completed_count, total)
+                progress_callback(completed_count, total, [x for x in analysis_data if x is not None])
                 
     return analysis_data
 
 def analyze_requirements(requirements: List[Requirement], llm=None, progress_callback=None, rag=None, mode="single", selected_collections=None) -> List[Dict[str, Any]]:
-    """
-    Perform an AI-driven ASPICE/INCOSE audit using NVIDIA LLM concurrently or in batches,
-    concentrating on the EARS action statement and referencing RAG rules if available.
-    """
     if not llm:
         raise ValueError("LLMManager is required for quality analysis.")
 
@@ -240,12 +244,11 @@ def analyze_requirements(requirements: List[Requirement], llm=None, progress_cal
     if mode == "batch":
         return analyze_requirements_batch(requirements, llm, progress_callback, rag, selected_collections)
 
-    # Pre-compute RAG contexts in a single batch embeddings query
     rag_contexts = [""] * total
     if rag:
         try:
-            action_parts = [split_ears(r.content)[1] for r in requirements]
-            rag_contexts = rag.query_batch(action_parts, collection_name=selected_collections, top_k=2)
+            full_reqs = [r.content for r in requirements]
+            rag_contexts = rag.query_batch(full_reqs, collection_name=selected_collections, top_k=2)
         except Exception:
             pass
 
@@ -262,11 +265,16 @@ def analyze_requirements(requirements: List[Requirement], llm=None, progress_cal
             analysis_data[index] = result
             completed_count += 1
             if progress_callback:
-                progress_callback(completed_count, total)
+                progress_callback(completed_count, total, [x for x in analysis_data if x is not None])
                 
     return analysis_data
 
-def correct_single_requirement(index, r, llm, rag, rag_context=None, selected_collections=None):
+def correct_single_requirement(index, r, llm, rag, rag_context=None, selected_collections=None, feedback_rule=None, feedback_rationale=None, initial_text=None):
+    max_retries = 3
+    current_text = initial_text if initial_text is not None else r.content
+    failed_rule = feedback_rule
+    rationale = feedback_rationale
+    
     try:
         if rag_context is None:
             rag_context = ""
@@ -276,53 +284,254 @@ def correct_single_requirement(index, r, llm, rag, rag_context=None, selected_co
                 except Exception:
                     pass
     
-        system_prompt = (
-            "You are a systems engineering expert specializing in ASPICE, ISO 26262, and EARS.\n"
-            "Your task is to correct/rewrite a flawed engineering requirement by structurally parsing it and fixing only the sections that violate rules.\n"
-            "Rules:\n"
-            "1. EARS Syntax: Ensure preconditions/triggers start with standard EARS keywords (If, When, While, Where). Rewrite them if they are malformed.\n"
-            "2. Modality: Enforce the standard modal verb 'shall'. Replace should, will, must, behaves.\n"
-            "3. Action Part: Remove vague or subjective terms and replace them with specific, measurable criteria.\n"
-        )
-        if rag_context:
-            system_prompt += (
-                "\nIn addition to standard rules, you MUST also conform to these project-specific rules retrieved from the knowledge base:\n"
-                f"{rag_context}\n"
-            )
-        system_prompt += (
-            "\n4. If the requirement is already fully compliant, return it EXACTLY as-is.\n"
-            "5. Reconstruct the fully corrected requirement string. Return ONLY the fully corrected requirement string. Do not include explanations, quotes, or markdown format blocks."
-        )
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": f"Full Requirement Context: \"{r.content}\""}
-        ]
-        
-        response = llm.get_response(messages, stream=False)
-        full_corrected = response.choices[0].message.content.strip()
-        
-        # Clean markdown code blocks
-        if full_corrected.startswith("```"):
-            lines = full_corrected.splitlines()
-            if len(lines) >= 2:
-                if lines[0].startswith("```"):
-                    lines = lines[1:]
-                if lines[-1].endswith("```"):
-                    lines = lines[:-1]
+        for attempt in range(max_retries):
+            system_prompt = """
+You are a Senior Systems Engineer, INCOSE Requirements Expert,
+EARS Expert, ASPICE Assessor, and ISO 26262 Functional Safety Engineer.
+
+Your task is to review and correct engineering requirements.
+
+MANDATORY RULES
+
+1. EARS Compliance
+- Determine the correct EARS pattern:
+  - Ubiquitous
+  - Event Driven
+  - State Driven
+  - Optional Feature
+  - Unwanted Behavior
+  - Complex
+- Rewrite the requirement using the appropriate EARS syntax.
+- Use standard EARS keywords only:
+  - WHEN
+  - WHILE
+  - IF ... THEN
+  - WHERE
+
+2. Modal Verb
+- Use SHALL as the only modal verb.
+- Replace:
+  - should
+  - will
+  - must
+  - can
+  - may
+  - behaves
+with SHALL where appropriate.
+
+3. INCOSE Compliance
+Ensure each requirement is:
+- Necessary
+- Correct
+- Unambiguous
+- Complete
+- Singular
+- Feasible
+- Verifiable
+- Consistent
+- Traceable
+- Implementation Free
+
+4. Atomic Requirement Rule
+A requirement shall contain EXACTLY ONE system behavior.
+
+ONE SHALL = ONE REQUIREMENT.
+
+Split the requirement if:
+- Multiple actions occur after SHALL.
+- Multiple verbs are connected by AND.
+- Multiple verbs are connected by OR.
+- Multiple actions are separated by commas.
+- Detection and reaction are combined.
+- Calculation and transmission are combined.
+- Monitoring and reporting are combined.
+- Fault detection and fault handling are combined.
+- Logging and notification are combined.
+
+When splitting:
+- Repeat the exact same trigger/precondition.
+- Preserve all timing constraints.
+- Preserve all fault identifiers.
+- Preserve all DTC references.
+- Preserve all safety intent.
+- Preserve ASIL-related information.
+- Preserve thresholds and units.
+
+5. Ambiguity Removal
+Replace vague words such as:
+- appropriate
+- sufficient
+- normal
+- quickly
+- efficiently
+- robust
+- user-friendly
+- timely
+- optimized
+- safe
+
+with specific and measurable criteria whenever possible.
+
+6. Preservation Rules
+DO NOT:
+- Add new functionality.
+- Invent values.
+- Change thresholds.
+- Change timing constraints.
+- Change fault IDs.
+- Change DTC identifiers.
+- Change safety intent.
+
+ONLY correct violations.
+
+7. Self-Validation Before Returning
+Verify:
+- Every requirement contains SHALL.
+- Every requirement follows EARS syntax.
+- Every requirement contains exactly one behavior.
+- No ambiguous terms remain.
+- Timing constraints are preserved.
+- Units are preserved.
+- Safety intent is preserved.
+
+OUTPUT FORMAT
+
+Return JSON only.
+
+{
+  "split_required": true,
+  "corrected_requirements": [
+    "WHEN condition, THE SYSTEM SHALL perform action A.",
+    "WHEN condition, THE SYSTEM SHALL perform action B."
+  ]
+}
+
+If no correction is needed:
+
+{
+  "split_required": false,
+  "corrected_requirements": [
+    "<original requirement exactly as provided>"
+  ]
+}
+
+Do not include explanations.
+Do not include markdown.
+Do not include code fences.
+Return valid JSON only.
+"""
+
+            system_prompt += """
+
+EXAMPLE
+
+Input:
+
+IF VehSpd AliveCounter is unchanged for [3 consecutive cycles],
+THEN THE SYSTEM SHALL:
+- detect F_ALC_VehSpd within [10 ms]
+- react within [10 ms]
+- set DTC_101_VSPD_ALC
+- transition to safe state.
+
+Output:
+
+{
+  "split_required": true,
+  "corrected_requirements": [
+    "IF VehSpd AliveCounter is unchanged for [3 consecutive cycles], THEN THE SYSTEM SHALL detect F_ALC_VehSpd within [10 ms].",
+    "IF VehSpd AliveCounter is unchanged for [3 consecutive cycles], THEN THE SYSTEM SHALL react within [10 ms].",
+    "IF VehSpd AliveCounter is unchanged for [3 consecutive cycles], THEN THE SYSTEM SHALL set DTC_101_VSPD_ALC.",
+    "IF VehSpd AliveCounter is unchanged for [3 consecutive cycles], THEN THE SYSTEM SHALL transition to safe state."
+  ]
+}
+"""
+            if rag_context:
+                system_prompt += (
+                    "\nIn addition to standard rules, you MUST also conform to these project-specific rules retrieved from the knowledge base:\n"
+                    f"{rag_context}\n"
+                )
+            
+            
+            if failed_rule and rationale:
+                system_prompt += (
+                    f"\n\nIMPORTANT FEEDBACK ON PREVIOUS ATTEMPT:\n"
+                    f"Your previous correction failed the '{failed_rule}' rule.\n"
+                    f"Rationale for failure: {rationale}\n"
+                    "Please fix this specific issue and ensure all rules are followed."
+                )
+                
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"Full Requirement Context: \"{current_text}\""}
+            ]
+            
+            response = llm.get_response(messages, stream=False)
+
+            raw_response = response.choices[0].message.content.strip()
+
+            try:
+                data = clean_and_parse_json(raw_response)
+
+                split_required = data.get("split_required", False)
+
+                corrected_requirements = data.get(
+                    "corrected_requirements",
+                    []
+                )
+
+                if corrected_requirements:
+                    full_corrected = "\n".join(
+                        req.strip()
+                        for req in corrected_requirements
+                        if req and req.strip()
+                    )
+                else:
+                    full_corrected = current_text
+
+            except Exception:
+                # Fallback for models that return plain text
+                full_corrected = raw_response
+
+            if full_corrected.startswith("```"):
+                lines = full_corrected.splitlines()
+                if len(lines) >= 2:
+                    if lines[0].startswith("```"):
+                        lines = lines[1:]
+                    if lines[-1].endswith("```"):
+                        lines = lines[:-1]
                 full_corrected = "\n".join(lines).strip()
-        # Clean quotes if any
-        if (full_corrected.startswith('"') and full_corrected.endswith('"')) or (full_corrected.startswith("'") and full_corrected.endswith("'")):
-            full_corrected = full_corrected[1:-1].strip()
+
+            if (
+                full_corrected.startswith('"')
+                and full_corrected.endswith('"')
+            ) or (
+                full_corrected.startswith("'")
+                and full_corrected.endswith("'")
+            ):
+                full_corrected = full_corrected[1:-1].strip()
+
+            if not full_corrected:
+                full_corrected = current_text
+                
+            temp_r = Requirement(name=r.name, content=full_corrected, rationale=r.rationale)
+            temp_r.state = r.state
+            temp_r.asil = r.asil
             
-        if not full_corrected:
-            full_corrected = r.content
+            _, analysis_res = analyze_single_requirement(index, temp_r, llm, rag, rag_context, selected_collections)
             
-        return index, r, r.content, full_corrected, full_corrected
+            if analysis_res.get("Status") == "Passed" or attempt == max_retries - 1:
+                return index, r, r.content, full_corrected, full_corrected
+                
+            failed_rule = analysis_res.get("Failed Rule", "Unknown")
+            rationale = analysis_res.get("Rationale", "Still violates rules")
+            current_text = full_corrected
+            
+        return index, r, r.content, current_text, current_text
     except Exception as e:
         return index, r, r.content, f"LLM Error: {str(e)}", r.content
 
 def correct_batch(batch_items, llm, rag, selected_collections=None):
-    # batch_items: list of (idx, r)
     req_details = []
     full_reqs = []
     for idx, r in batch_items:
@@ -348,7 +557,8 @@ def correct_batch(batch_items, llm, rag, selected_collections=None):
         "1. EARS Syntax: Ensure preconditions/triggers start with standard EARS keywords (If, When, While, Where). Rewrite them if they are malformed.\n"
         "2. Modality: Enforce the standard modal verb 'shall'. Replace should, will, must, behaves.\n"
         "3. Action Part: Remove vague or subjective terms and replace them with specific, measurable criteria.\n"
-        "4. If the requirement is already compliant, keep it EXACTLY as-is.\n\n"
+        "4. Atomic Requirements: A requirement MUST NOT combine multiple distinct actions. If a requirement contains multiple distinct actions, you MUST split it into multiple distinct requirements. Each split requirement MUST repeat the exact same precondition/trigger from the original requirement. Separate them with a single newline (do NOT use bullet points).\n"
+        "5. If the requirement is already compliant, keep it EXACTLY as-is.\n\n"
         "For each requirement in the batch, structurally parse and rewrite it if needed. Reconstruct the fully corrected requirement.\n\n"
         "You must return your output strictly in JSON format matching this schema:\n"
         "{\n"
@@ -412,7 +622,6 @@ def correct_batch(batch_items, llm, rag, selected_collections=None):
             else:
                 full_corrected = str(full_corrected).strip()
                 
-            # Clean markdown code blocks and quotes
             if full_corrected.startswith("```"):
                 lines = full_corrected.splitlines()
                 if len(lines) >= 2:
@@ -431,13 +640,54 @@ def correct_batch(batch_items, llm, rag, selected_collections=None):
         else:
             raise ValueError(f"Requirement index {idx} / ID '{item['r'].name}' not found in LLM response.")
             
+    # Verify the batch corrections
+    verify_items = []
+    for idx, (r_obj, original_text, action_part, full_corrected) in batch_results.items():
+        temp_r = Requirement(name=r_obj.name, content=full_corrected, rationale=r_obj.rationale)
+        temp_r.state = r_obj.state
+        temp_r.asil = r_obj.asil
+        verify_items.append((idx, temp_r))
+        
+    try:
+        verify_res = analyze_batch(verify_items, llm, rag, selected_collections)
+    except Exception:
+        verify_res = {}
+        
+    for idx, (r_obj, original_text, action_part, full_corrected) in batch_results.items():
+        v_res = verify_res.get(idx, {})
+        if v_res.get("Status") == "Review":
+            _, _, _, _, retried_corrected = correct_single_requirement(
+                idx, r_obj, llm, rag, None, selected_collections,
+                feedback_rule=v_res.get("Failed Rule"),
+                feedback_rationale=v_res.get("Rationale"),
+                initial_text=full_corrected
+            )
+            batch_results[idx] = (r_obj, original_text, action_part, retried_corrected)
+            
     return batch_results
+
+def _expand_corrections(correction_data_map):
+    correction_data = []
+    for k in sorted(correction_data_map.keys()):
+        r_info = correction_data_map[k]
+        corrected_text = r_info["Corrected Requirement"]
+        
+        split_reqs = [req.strip() for req in corrected_text.split('\n') if req.strip()]
+        
+        for i, split_req in enumerate(split_reqs):
+            new_id = r_info["ID"] if len(split_reqs) == 1 else f"{r_info['ID']}.{i+1}"
+            correction_data.append({
+                "ID": new_id,
+                "Original Requirement": r_info["Original Requirement"],
+                "Corrected Requirement": split_req
+            })
+    return correction_data
 
 def correct_requirements_batch(requirements: List[Requirement], llm, progress_callback=None, rag=None, selected_collections=None) -> List[Dict[str, Any]]:
     total = len(requirements)
     correction_data_map = {}
     
-    batch_size = 5
+    batch_size = 10
     batches = []
     for i in range(0, total, batch_size):
         batches.append([(idx, requirements[idx]) for idx in range(i, min(i + batch_size, total))])
@@ -446,41 +696,33 @@ def correct_requirements_batch(requirements: List[Requirement], llm, progress_ca
         try:
             return correct_batch(batch, llm, rag, selected_collections)
         except Exception:
-            # Fallback to single requirement correction
             fallback_results = {}
             for idx, r in batch:
                 _, r_obj, action_part, corrected_action, full_corrected = correct_single_requirement(idx, r, llm, rag, selected_collections=selected_collections)
                 fallback_results[idx] = (r_obj, action_part, corrected_action, full_corrected)
             return fallback_results
 
-    with ThreadPoolExecutor(max_workers=4) as executor:
+    with ThreadPoolExecutor(max_workers=6) as executor:
         futures = {executor.submit(process_batch, b): b for b in batches}
         
         completed_count = 0
         for future in as_completed(futures):
             batch_res = future.result()
-            for idx, (r, action_part, corrected_action, full_corrected) in batch_res.items():
+            for idx, res in batch_res.items():
+                correction_data_map[idx] = {
+                    "ID": res[0].name,
+                    "Original Requirement": res[0].content,
+                    "Corrected Requirement": res[3]
+                }
                 completed_count += 1
-                if corrected_action.strip().lower() != action_part.strip().lower():
-                    correction_data_map[idx] = {
-                        "ID": r.name,
-                        "Original Requirement": r.content,
-                        "Rationale of Issue": r.rationale if r.rationale else "Identified non-compliance in EARS action part",
-                        "Corrected Requirement": full_corrected
-                    }
             if progress_callback:
-                progress_callback(completed_count, total)
+                progress_callback(completed_count, total, _expand_corrections(correction_data_map))
                 
-    correction_data = [correction_data_map[k] for k in sorted(correction_data_map.keys())]
-    return correction_data
+    return _expand_corrections(correction_data_map)
 
 def correct_requirements(requirements: List[Requirement], llm=None, progress_callback=None, rag=None, mode="single", selected_collections=None) -> List[Dict[str, Any]]:
-    """
-    Rewrite problematic requirements using the LLM concurrently or in batches, preserving precondition prefixes
-    and applying RAG baseline knowledge rules if uploaded.
-    """
     if not llm:
-        raise ValueError("LLMManager is required for requirement corrections.")
+        raise ValueError("LLMManager is required for quality analysis.")
 
     total = len(requirements)
     if total == 0:
@@ -489,12 +731,11 @@ def correct_requirements(requirements: List[Requirement], llm=None, progress_cal
     if mode == "batch":
         return correct_requirements_batch(requirements, llm, progress_callback, rag, selected_collections)
 
-    # Pre-compute RAG contexts in a single batch embeddings query
     rag_contexts = [""] * total
     if rag:
         try:
-            action_parts = [split_ears(r.content)[1] for r in requirements]
-            rag_contexts = rag.query_batch(action_parts, collection_name=selected_collections, top_k=2)
+            full_reqs = [r.content for r in requirements]
+            rag_contexts = rag.query_batch(full_reqs, collection_name=selected_collections, top_k=2)
         except Exception:
             pass
 
@@ -507,61 +748,46 @@ def correct_requirements(requirements: List[Requirement], llm=None, progress_cal
         
         completed_count = 0
         for future in as_completed(futures):
-            index, r, action_part, corrected_action, full_corrected = future.result()
+            index, r_obj, action_part, corrected_action, full_corrected = future.result()
+            correction_data_map[index] = {
+                "ID": r_obj.name,
+                "Original Requirement": r_obj.content,
+                "Corrected Requirement": full_corrected
+            }
             completed_count += 1
             if progress_callback:
-                progress_callback(completed_count, total)
+                progress_callback(completed_count, total, _expand_corrections(correction_data_map))
                 
-            if corrected_action.strip().lower() != action_part.strip().lower():
-                correction_data_map[index] = {
-                    "ID": r.name,
-                    "Original Requirement": r.content,
-                    "Rationale of Issue": r.rationale if r.rationale else "Identified non-compliance in EARS action part",
-                    "Corrected Requirement": full_corrected
-                }
-                
-    # Reassemble correction items ordered by original sequence
-    correction_data = [correction_data_map[k] for k in sorted(correction_data_map.keys())]
-    return correction_data
+    return _expand_corrections(correction_data_map)
 
 def generate_markdown_report(analysis_results: List[Dict[str, Any]], correction_results: List[Dict[str, Any]], file_title: str) -> str:
-    """
-    Generates a professional Markdown quality report for download.
-    """
-    total = len(analysis_results)
-    passed = sum(1 for item in analysis_results if item["Status"] == "Passed")
-    review = total - passed
-    score = int((passed / total) * 100) if total > 0 else 0
+    md_content = f"# Compliance Report: {file_title}\n\n"
+    md_content += "## Validation Issues\n\n"
     
-    md = [
-        f"# EARS/INCOSE Requirements Quality Audit Report",
-        f"**Target Specification File**: `{file_title}`",
-        f"**Overall Compliance Score**: `{score}%`",
-        f"",
-        f"## 1. Executive Summary",
-        f"- **Total Checked Requirements**: {total}",
-        f"- **Passed (Compliant)**: {passed}",
-        f"- **Review Needed (Non-compliant)**: {review}",
-        f"",
-        f"## 2. Detailed Quality Audit Findings",
-        f"| Requirement ID | Audit Status | Failed Rule | Rationale |",
-        f"| :--- | :--- | :--- | :--- |"
-    ]
-    
-    for item in analysis_results:
-        clean_rat = item["Rationale"].replace("\n", " ").replace("|", "\\|")
-        md.append(f"| {item['ID']} | {item['Status']} | {item['Failed Rule']} | {clean_rat} |")
+    issues_found = False
+    for r in analysis_results:
+        if r.get("Status") == "Review":
+            issues_found = True
+            md_content += f"### ID: {r.get('ID', 'N/A')}\n"
+            md_content += f"**Requirement:** {r.get('Requirement', '')}\n\n"
+            md_content += f"**Failed Rule:** {r.get('Failed Rule', 'Unknown')}\n\n"
+            md_content += f"**Rationale:** {r.get('Rationale', '')}\n\n"
+            md_content += "---\n\n"
+            
+    if not issues_found:
+        md_content += "No compliance issues found!\n\n"
         
     if correction_results:
-        md.extend([
-            f"",
-            f"## 3. Recommended EARS Action-Part Rewrites",
-            f"| ID | Original Requirement | Corrected Requirement (Preserved Precondition) |",
-            f"| :--- | :--- | :--- |"
-        ])
-        for corr in correction_results:
-            clean_orig = corr["Original Requirement"].replace("\n", " ").replace("|", "\\|")
-            clean_corr = corr["Corrected Requirement"].replace("\n", " ").replace("|", "\\|")
-            md.append(f"| {corr['ID']} | {clean_orig} | {clean_corr} |")
+        md_content += "## Automated Corrections\n\n"
+        corrections_found = False
+        for cr in correction_results:
+            if cr.get("Original Requirement") != cr.get("Corrected Requirement"):
+                corrections_found = True
+                md_content += f"### ID: {cr.get('ID', 'N/A')}\n"
+                md_content += f"**Original:** {cr.get('Original Requirement', '')}\n\n"
+                md_content += f"**Corrected:** {cr.get('Corrected Requirement', '')}\n\n"
+                md_content += "---\n\n"
+        if not corrections_found:
+            md_content += "No corrections needed!\n\n"
             
-    return "\n".join(md)
+    return md_content
